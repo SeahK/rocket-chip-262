@@ -7,8 +7,29 @@ import chisel3.experimental.DataMirror
 import chisel3.util._
 import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.tilelink.Util.wrappingAdd
 import freechips.rocketchip.util._
 
+
+// some utilities function
+object Util {
+  def wrappingAdd(u: UInt, n: UInt, max_plus_one: UInt, en: Bool = true.B): UInt = {
+    val max = max_plus_one - 1.U
+    assert(n <= max || max === 0.U, "cannot wrapAdd when n is larger than max, unless max is 0")
+
+    /*
+  Mux(!en, u,
+    Mux (max === 0.U, 0.U,
+      Mux(u >= max - n + 1.U && n =/= 0.U, n - (max - u) - 1.U, u + n)))
+  */
+
+    MuxCase(u + n, Seq(
+      (!en) -> u,
+      (max === 0.U) -> 0.U,
+      (u >= max - n + 1.U && n =/= 0.U) -> (n - (max - u) - 1.U)
+    ))
+  }
+}
 // Trades off slave port proximity against routing resource cost
 object ForceFanout
 {
@@ -241,7 +262,7 @@ object TLXbar_ACancel
     // Transform input bundle sources (sinks use global namespace on both sides)
     val in = Wire(Vec(io_in.size, TLBundle_ACancel(wide_bundle)))
 
-    // added part
+    ///////////////////////////////////////// added part////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //    val in_a_que = Seq.fill(io_in.size){Module(new Queue(new TLBundleA(in(0).a.bits.params), 5))} // need change
     val in_a_que = (0 until in.size).map{i => Module(new Queue(new TLBundleA(in(i).a.bits.params), 5))}
 
@@ -250,6 +271,9 @@ object TLXbar_ACancel
     println(connectAIO.foreach(println(_)))
     val gemminipri_reorder = WireInit(false.B) // activate reordering?
     val prior_vec_uint = Wire(Vec(in.size, UInt(2.W)))
+    val reorder_count = RegInit(0.U(5.W)) // count number of reordering
+    val reorder_count_max = WireInit(8.U) // 8:1 ratio (ToDo: configurable)
+    val reordered = WireInit(false.B) // whether it is reordered or not (use to count up reorder_count)
 
     if(in.size != 0){
       val prior_vec = VecInit(Seq.fill(in.size)(false.B))
@@ -289,8 +313,12 @@ object TLXbar_ACancel
 
 
         if(!io_in(i).a.bits.user.lift(GemminiPri).isEmpty){
-          in_q_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U), false.B, in(i).a.ready)//true.B)
-          in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U), true.B, false.B) // would this work?
+          in_q_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
+          in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), true.B, false.B) // would this work?
+
+          when(gemminipri_reorder && (prior_vec_uint(i) === 3.U) && in_q_que_ios(i).deq.fire()){
+            reordered := true.B
+          }
 
           println("gemminipri exist")
           println(io_in(i).a.bits.params)
@@ -316,6 +344,8 @@ object TLXbar_ACancel
          */
       }
       //in(i).a.bits.source := in_a_que(i).io.deq.bits.tl_a.bits.source // what is r start?
+      reorder_count := wrappingAdd(reorder_count, 1.U, reorder_count_max, reordered)
+      /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
       if (connectBIO(i).exists(x=>x)) {
         io_in(i).b :<> in(i).b
