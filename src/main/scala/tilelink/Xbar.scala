@@ -3,6 +3,7 @@
 package freechips.rocketchip.tilelink
 
 import chisel3._
+import chisel3.experimental.DataMirror
 import chisel3.util._
 import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
@@ -50,6 +51,7 @@ class TLXbar(policy: TLArbiter.Policy = TLArbiter.roundRobin)(implicit p: Parame
       val fifoIdFactory = TLXbar.relabeler()
       seq(0).v1copy(
         responseFields = BundleField.union(seq.flatMap(_.responseFields)),
+//        responseFields = BundleField.union(seq.flatMap(_.responseFields) :+ GemminiPriField()),
         requestKeys = seq.flatMap(_.requestKeys).distinct,
         minLatency = seq.map(_.minLatency).min,
         endSinkId = TLXbar.mapOutputIds(seq).map(_.end).max,
@@ -183,6 +185,15 @@ object TLXbar
   }
 }
 
+// added for priority encoding
+case object GemminiPri extends ControlKey[UInt]("pri_port")
+case class GemminiPriField() extends BundleField(GemminiPri) {
+  def data = Output(UInt(2.W))
+  def default(x: UInt): Unit = {
+    x := 0.U
+  }
+}
+
 object TLXbar_ACancel
 {
   def circuit(policy: TLArbiter.Policy, seqIn: Seq[(TLBundle_ACancel, TLEdge)], seqOut: Seq[(TLBundle_ACancel, TLEdge)]): Unit = {
@@ -229,20 +240,82 @@ object TLXbar_ACancel
 
     // Transform input bundle sources (sinks use global namespace on both sides)
     val in = Wire(Vec(io_in.size, TLBundle_ACancel(wide_bundle)))
+
+    // added part
+//    val in_a_que = Seq.fill(io_in.size){Module(new Queue(new TLBundleA(in(0).a.bits.params), 5))} // need change
+    val in_a_que = (0 until in.size).map{i => Module(new Queue(new TLBundleA(in(i).a.bits.params), 5))}
+
+    val in_q_que_ios = in_a_que.map(_.io)
+    println(in.size)
+    println(connectAIO.foreach(println(_)))
+    val gemminipri_reorder = WireInit(false.B) // activate reordering?
+    val prior_vec_uint = Wire(Vec(in.size, UInt(2.W)))
+
+    if(in.size != 0){
+      val prior_vec = VecInit(Seq.fill(in.size)(false.B))
+
+      for(i <- 0 until in.size){
+        in_a_que(i).io.deq.bits.user.lift(GemminiPri).foreach{x => dontTouch(x)}
+        prior_vec_uint(i) := 0.U
+        //prior_vec(i).foreach{x => dontTouch(x)}
+        //getOrElse
+        if(!in_a_que(i).io.deq.bits.user.lift(GemminiPri).isEmpty) {
+          prior_vec_uint := (0 until in.size).map{i => in_a_que(i).io.deq.bits.user.lift(GemminiPri).get}
+          prior_vec(i) := Mux(in_a_que(i).io.deq.bits.user.lift(GemminiPri).get === 3.U, true.B, false.B) // get pri field for the last element in the queue
+        }
+      }
+      gemminipri_reorder := prior_vec.reduce(_||_)
+      dontTouch(gemminipri_reorder)
+      dontTouch(prior_vec_uint)
+      dontTouch(prior_vec)
+    }
+
     for (i <- 0 until in.size) {
       val r = inputIdRanges(i)
 
-      if (connectAIO(i).exists(x=>x)) {
-        in(i).a :<> io_in(i).a
-        in(i).a.bits.source := io_in(i).a.bits.source | r.start.U
+      if(connectAIO(i).exists(x=>x)){
+        in_q_que_ios(i).enq.valid := true.B
+        in_q_que_ios(i).deq.ready := true.B
+
+        in_q_que_ios(i).enq :<> io_in(i).a.asDecoupled()
+        in_q_que_ios(i).enq.bits.source := io_in(i).a.bits.source | r.start.U
+        //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it does not work at all here
+
+        // this also does not work (stall right after first reordering)
+        in(i).a.earlyValid := in_q_que_ios(i).deq.valid
+        in(i).a.lateCancel := false.B
+        in(i).a.bits := in_q_que_ios(i).deq.bits
+        in_q_que_ios(i).deq.ready := in(i).a.ready
+
+
+        if(!io_in(i).a.bits.user.lift(GemminiPri).isEmpty){
+          in_q_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U), false.B, in(i).a.ready)//true.B)
+          in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U), true.B, false.B) // would this work?
+
+          println("gemminipri exist")
+          println(io_in(i).a.bits.params)
+          in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}  // GemminiPri
+        }
+        //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it works, but not as expected
+        dontTouch(in(i).a.ready)
+
+
       } else {
-        in(i).a.earlyValid := false.B
-        in(i).a.lateCancel := DontCare
-        in(i).a.bits       := DontCare
+        scala.Predef.assert(false)
+        throw new RuntimeException()
+        /*
+        in_q_que_ios(i).enq.bits.earlyValid := false.B
+        in_q_que_ios(i).enq.bits.lateCancel := DontCare
+        in_q_que_ios(i).enq.bits.bits := DontCare
+
+        // here? or depends on the output of the queue
         io_in(i).a.ready      := true.B
         io_in(i).a.lateCancel := DontCare
         io_in(i).a.bits       := DontCare
+
+         */
       }
+      //in(i).a.bits.source := in_a_que(i).io.deq.bits.tl_a.bits.source // what is r start?
 
       if (connectBIO(i).exists(x=>x)) {
         io_in(i).b :<> in(i).b
