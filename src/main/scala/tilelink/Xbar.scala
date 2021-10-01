@@ -3,7 +3,7 @@
 package freechips.rocketchip.tilelink
 
 import chisel3._
-import chisel3.experimental.DataMirror
+//import chisel3.experimental.DataMirror
 import chisel3.util._
 import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
@@ -264,28 +264,59 @@ object TLXbar_ACancel
 
     ///////////////////////////////////////// added part////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //    val in_a_que = Seq.fill(io_in.size){Module(new Queue(new TLBundleA(in(0).a.bits.params), 5))} // need change
-    val in_a_que = (0 until in.size).map{i => Module(new Queue(new TLBundleA(in(i).a.bits.params), 5))}
+    val in_a_que = (0 until in.size).map{i => Module(new Queue(new TLBundleA(in(i).a.bits.params), 3))}
 
-    val in_q_que_ios = in_a_que.map(_.io)
+    // single entry queue for bypassing
+    //val in_a_bypass_que = (0 until in.size).map{i => Module(new Queue(new TLBundleA(in(i).a.bits.params), pipe = true, flow = true, entries = 1))}
+    val in_a_bypass_que = (0 until in.size).map{i => Module(new Queue(new TLBundleA(in(i).a.bits.params), entries = 1))}
+
+    val in_a_que_ios = in_a_que.map(_.io)
     println(in.size)
     println(connectAIO.foreach(println(_)))
+    //val prior_vec = VecInit(Seq.fill(in.size)(false.B))
     val gemminipri_reorder = WireInit(false.B) // activate reordering?
     val prior_vec_uint = Wire(Vec(in.size, UInt(2.W)))
+    val prior_vec_bypass_uint = Wire(Vec(in.size, UInt(2.W)))
     val reorder_count = RegInit(0.U(5.W)) // count number of reordering
-    val reorder_count_max = WireInit(8.U) // 8:1 ratio (ToDo: configurable)
+    val reorder_count_max = WireInit(6.U) // 8:1 ratio (ToDo: configurable)
     val reordered = WireInit(false.B) // whether it is reordered or not (use to count up reorder_count)
+
+    // to debug
+    //val fire_vec = Wire(Vec(in.size, Bool))//VecInit(Seq.fill(in.size)(false.B))
+    val fire_prior_uint = Wire(Vec(in.size, UInt(2.W)))
+    //dontTouch(fire_vec)
+    dontTouch(fire_prior_uint)
 
     if(in.size != 0){
       val prior_vec = VecInit(Seq.fill(in.size)(false.B))
+      val fire_vec = VecInit(Seq.fill(in.size)(false.B))
+      val prior_in_vec = VecInit(Seq.fill(in.size)(false.B))
+      dontTouch(fire_vec)
+      dontTouch(prior_in_vec) // for debugging
+      fire_prior_uint := (0 until in.size).map{i => 0.U}
 
       for(i <- 0 until in.size){
         in_a_que(i).io.deq.bits.user.lift(GemminiPri).foreach{x => dontTouch(x)}
         prior_vec_uint(i) := 0.U
+        prior_vec_bypass_uint(i) := 0.U
         //prior_vec(i).foreach{x => dontTouch(x)}
+        fire_vec(i) := in(i).a.fire()
         //getOrElse
+
         if(!in_a_que(i).io.deq.bits.user.lift(GemminiPri).isEmpty) {
-          prior_vec_uint := (0 until in.size).map{i => in_a_que(i).io.deq.bits.user.lift(GemminiPri).get}
-          prior_vec(i) := Mux(in_a_que(i).io.deq.bits.user.lift(GemminiPri).get === 3.U, true.B, false.B) // get pri field for the last element in the queue
+          //prior_vec_uint := (0 until in.size).map{i => in_a_que(i).io.deq.bits.user.lift(GemminiPri).get}
+          prior_vec_uint(i) := in_a_que(i).io.deq.bits.user.lift(GemminiPri).get
+          if(!io_in(i).a.bits.user.lift(GemminiPri).isEmpty){
+            prior_vec_bypass_uint(i) := in_a_bypass_que(i).io.deq.bits.user.lift(GemminiPri).get//io_in(i).a.bits.user.lift(GemminiPri).get
+            prior_in_vec(i) := io_in(i).a.bits.user.lift(GemminiPri).get
+          }
+          else{
+            prior_vec_bypass_uint(i) := 0.U
+          }
+          //prior_vec(i) := (prior_vec_uint(i) === 3.U && in_a_que_ios(i).deq.valid) || (prior_vec_bypass_uint(i) === 3.U && in_a_bypass_que(i).io.deq.valid) // get pri field for the last element in the queue
+          prior_vec(i) := (prior_vec_bypass_uint(i) === 3.U) && (in_a_bypass_que(i).io.deq.valid)
+          //prior_vec(i) := Mux(in_a_que(i).io.deq.bits.user.lift(GemminiPri).get === 3.U, true.B, false.B) // get pri field for the last element in the queue
+          // considering bypass queue
         }
       }
       gemminipri_reorder := prior_vec.reduce(_||_)
@@ -298,33 +329,75 @@ object TLXbar_ACancel
       val r = inputIdRanges(i)
 
       if(connectAIO(i).exists(x=>x)){
-        in_q_que_ios(i).enq.valid := true.B
-        in_q_que_ios(i).deq.ready := true.B
+        //in_a_que_ios(i).enq.valid := true.B
+        in_a_que_ios(i).deq.ready := false.B
+        in_a_que_ios(i).enq.valid := false.B
 
-        in_q_que_ios(i).enq :<> io_in(i).a.asDecoupled()
-        in_q_que_ios(i).enq.bits.source := io_in(i).a.bits.source | r.start.U
-        //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it does not work at all here
+        in(i).a :<> ReadyValidCancel(in_a_bypass_que(i).io.deq)
+
+        in_a_que_ios(i).enq :<> io_in(i).a.asDecoupled()
+
+        // default as bypass
+        in_a_bypass_que(i).io.enq :<> io_in(i).a.asDecoupled()
+        in_a_bypass_que(i).io.enq.bits.source := io_in(i).a.bits.source | r.start.U
+
+        /*
+        in_a_que_ios(i).enq :<> io_in(i).a.asDecoupled()
+        in_a_que_ios(i).enq.bits.source := io_in(i).a.bits.source | r.start.U
+        //in(i).a :<> ReadyValidCancel(in_a_que_ios(i).deq) // it does not work at all here
 
         // this also does not work (stall right after first reordering)
-        in(i).a.earlyValid := in_q_que_ios(i).deq.valid
+        in(i).a.earlyValid := in_a_que_ios(i).deq.valid
         in(i).a.lateCancel := false.B
-        in(i).a.bits := in_q_que_ios(i).deq.bits
-        in_q_que_ios(i).deq.ready := in(i).a.ready
-
-
+        in(i).a.bits := in_a_que_ios(i).deq.bits
+        in_a_que_ios(i).deq.ready := in(i).a.ready
+         */
         if(!io_in(i).a.bits.user.lift(GemminiPri).isEmpty){
-          in_q_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
-          in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), true.B, false.B) // would this work?
+          val gemminipri_input = io_in(i).a.bits.user.lift(GemminiPri).get
+          when(gemminipri_input === 3.U || ((gemminipri_input =/= 2.U) && (in_a_que(i).io.count === 0.U))){ // or io.deq.ready === false.B
+            in_a_bypass_que(i).io.enq :<> io_in(i).a.asDecoupled()
+            in_a_bypass_que(i).io.enq.bits.source := io_in(i).a.bits.source | r.start.U
+            in_a_bypass_que(i).io.enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}
+            in_a_que_ios(i).enq.valid := false.B // not enq caching queue
+          }.otherwise{
+            in_a_que_ios(i).enq :<> io_in(i).a.asDecoupled()
+            in_a_que_ios(i).enq.bits.source := io_in(i).a.bits.source | r.start.U
+            in_a_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}  // GemminiPri
+            in_a_bypass_que(i).io.enq.valid := false.B // not enq bypass queue
+          }
 
-          when(gemminipri_reorder && (prior_vec_uint(i) === 3.U) && in_q_que_ios(i).deq.fire()){
+          when(in_a_que_ios(i).deq.valid && prior_vec_uint(i) =/= 2.U){ // serve old queue first
+            in(i).a :<> ReadyValidCancel(in_a_que_ios(i).deq)
+            in_a_bypass_que(i).io.deq.ready := false.B
+          }.elsewhen(in_a_bypass_que(i).io.deq.valid){ // when there is valid entry @ priority queue
+            in(i).a :<> ReadyValidCancel(in_a_bypass_que(i).io.deq)
+            in_a_que_ios(i).deq.ready := false.B
+            // no late cancel
+          }.otherwise{ // get from cached queue if there is nothing prioritized requests
+            in(i).a :<> ReadyValidCancel(in_a_que_ios(i).deq)
+            in_a_bypass_que(i).io.deq.ready := false.B
+
+            // cancel the de-prioritized request (only gemmini deprior requests)
+            in_a_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
+            //in(i).a.lateCancel := gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U) // would this work?
+            in(i).a.earlyValid := (!(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U))) && in_a_que_ios(i).deq.valid // would this work?
+          }
+
+          //in_a_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
+          //in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), true.B, false.B) // would this work?
+
+          when(gemminipri_reorder && (in(i).a.bits.user.lift(GemminiPri).get === 3.U) && (in_a_que_ios(i).deq.fire() || in_a_bypass_que(i).io.deq.fire())){ // ToDo: may need to be fixed
             reordered := true.B
           }
 
           println("gemminipri exist")
           println(io_in(i).a.bits.params)
-          in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}  // GemminiPri
+          dontTouch(reordered)
+
+
+          fire_prior_uint(i) := in(i).a.bits.user.lift(GemminiPri).get
         }
-        //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it works, but not as expected
+        //in(i).a :<> ReadyValidCancel(in_a_que_ios(i).deq) // it works, but not as expected
         dontTouch(in(i).a.ready)
 
 
@@ -332,9 +405,9 @@ object TLXbar_ACancel
         scala.Predef.assert(false)
         throw new RuntimeException()
         /*
-        in_q_que_ios(i).enq.bits.earlyValid := false.B
-        in_q_que_ios(i).enq.bits.lateCancel := DontCare
-        in_q_que_ios(i).enq.bits.bits := DontCare
+        in_a_que_ios(i).enq.bits.earlyValid := false.B
+        in_a_que_ios(i).enq.bits.lateCancel := DontCare
+        in_a_que_ios(i).enq.bits.bits := DontCare
 
         // here? or depends on the output of the queue
         io_in(i).a.ready      := true.B
@@ -343,8 +416,10 @@ object TLXbar_ACancel
 
          */
       }
+
       //in(i).a.bits.source := in_a_que(i).io.deq.bits.tl_a.bits.source // what is r start?
-      reorder_count := wrappingAdd(reorder_count, 1.U, reorder_count_max, reordered)
+
+      //reorder_count := wrappingAdd(reorder_count, 1.U, reorder_count_max, reordered)
       /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
       if (connectBIO(i).exists(x=>x)) {
