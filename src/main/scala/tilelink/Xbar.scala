@@ -271,77 +271,86 @@ object TLXbar_ACancel
     val in_q_que_ios = in_a_que.map(_.io)
     println(in.size)
     println(connectAIO.foreach(println(_)))
-    val gemminipri_reorder = WireInit(false.B) // activate reordering?
+    //val gemminipri_reorder = WireInit(false.B) // activate reordering?
     val prior_vec_uint = Wire(Vec(in.size, UInt(2.W)))
     val reorder_count = RegInit(0.U(5.W)) // count number of reordering
     val reorder_count_max = WireInit(8.U) // 8:1 ratio (ToDo: configurable)
     val reordered = WireInit(false.B) // whether it is reordered or not (use to count up reorder_count)
 
-    if(in.size != 0){
+    if(in.size != 0) {
       val prior_vec = VecInit(Seq.fill(in.size)(false.B))
-
-      for(i <- 0 until in.size){
+      val gemminipri_reorder = prior_vec.reduce(_ || _)
+      for (i <- 0 until in.size) {
         // default: when need bypassing, fix in(0)
         in_a_arbiter(i).io.in(1) <> in_a_que(i).io.deq
         in_a_arbiter(i).io.in(0).valid := false.B
         in_a_arbiter(i).io.in(0).bits := DontCare
 
-        in_a_que(i).io.deq.bits.user.lift(GemminiPri).foreach{x => dontTouch(x)}
+        in_a_que(i).io.deq.bits.user.lift(GemminiPri).foreach { x => dontTouch(x) }
         prior_vec_uint(i) := 0.U
         //prior_vec(i).foreach{x => dontTouch(x)}
         //getOrElse
-        if(!in_a_que(i).io.deq.bits.user.lift(GemminiPri).isEmpty) {
-          //prior_vec_uint := (0 until in.size).map{i => in_a_que(i).io.deq.bits.user.lift(GemminiPri).get}
-          prior_vec_uint := (0 until in.size).map{i => in_a_arbiter(i).io.out.bits.user.lift(GemminiPri).get}
+        /*
+        if (!in_a_que(i).io.deq.bits.user.lift(GemminiPri).isEmpty) {
+          prior_vec_uint := (0 until in.size).map { i => in_a_arbiter(i).io.out.bits.user.lift(GemminiPri).get }
           prior_vec(i) := Mux(prior_vec_uint(i) === 3.U, true.B, false.B) // get pri field for the last element in the queue
         }
-      }
-      gemminipri_reorder := prior_vec.reduce(_||_)
-      dontTouch(gemminipri_reorder)
-      dontTouch(prior_vec_uint)
-      dontTouch(prior_vec)
-    }
+        gemminipri_reorder := prior_vec.reduce(_ || _)
+         */
+        dontTouch(gemminipri_reorder)
+        dontTouch(prior_vec_uint)
+        dontTouch(prior_vec)
 
-    for (i <- 0 until in.size) {
-      val r = inputIdRanges(i)
+        val r = inputIdRanges(i)
 
-      if(connectAIO(i).exists(x=>x)){
-        in_q_que_ios(i).enq.valid := true.B
-        //in_q_que_ios(i).deq.ready := true.B
+        if (connectAIO(i).exists(x => x)) {
+          in_q_que_ios(i).enq.valid := true.B
+          //in_q_que_ios(i).deq.ready := true.B
 
-        in_q_que_ios(i).enq :<> io_in(i).a.asDecoupled()
-        in_q_que_ios(i).enq.bits.source := io_in(i).a.bits.source | r.start.U
-        //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it does not work at all here
+          in_q_que_ios(i).enq :<> io_in(i).a.asDecoupled()
+          in_q_que_ios(i).enq.bits.source := io_in(i).a.bits.source | r.start.U
+          //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it does not work at all here
 
-        // this also does not work (stall right after first reordering)
-        //in(i).a.earlyValid := in_q_que_ios(i).deq.valid
-        //in(i).a.lateCancel := false.B
-        //in(i).a.bits := in_q_que_ios(i).deq.bits
-        //in_q_que_ios(i).deq.ready := in(i).a.ready
+          // this also does not work (stall right after first reordering)
+          //in(i).a.earlyValid := in_q_que_ios(i).deq.valid
+          //in(i).a.lateCancel := false.B
+          //in(i).a.bits := in_q_que_ios(i).deq.bits
+          //in_q_que_ios(i).deq.ready := in(i).a.ready
 
-        in(i).a :<> ReadyValidCancel(in_a_arbiter(i).io.out)
+          in(i).a :<> ReadyValidCancel(in_a_arbiter(i).io.out)
 
-        if(!io_in(i).a.bits.user.lift(GemminiPri).isEmpty){
-          //in_q_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
-          in_a_arbiter(i).io.out.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
-          in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), true.B, false.B) // would this work?
+          if (!io_in(i).a.bits.user.lift(GemminiPri).isEmpty) {
+            //bypass
+            //when(io_in(i).a.bits.user.lift(GemminiPri).get === 3.U || (io_in(i).a.bits.user.lift(GemminiPri).get =/= 2.U && in_a_que(i).io.count === 0.U)){
+            when(io_in(i).a.bits.user.lift(GemminiPri).get === 3.U && in_a_que(i).io.count =/= 0.U){
+              in_a_arbiter(i).io.in(0) <> io_in(i).a.asDecoupled()
+              in_a_arbiter(i).io.in(0).bits.source := io_in(i).a.bits.source | r.start.U
+              in_q_que_ios(i).enq.valid := false.B // not enq
+            }
+            prior_vec_uint(i) := in_a_arbiter(i).io.out.bits.user.lift(GemminiPri).get
+            prior_vec(i) := Mux(prior_vec_uint(i) === 3.U, true.B, false.B) // get pri field for the last element in the queue
 
-          when(gemminipri_reorder && (prior_vec_uint(i) === 3.U) && in_a_arbiter(i).io.out.fire()){// && in_q_que_ios(i).deq.fire()){
-            reordered := true.B
+            //in_q_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
+            in_a_arbiter(i).io.out.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
+            //in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), true.B, false.B) // would this work?
+            in(i).a.earlyValid := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in_a_arbiter(i).io.out.valid) // would this work?
+
+            when(gemminipri_reorder && (prior_vec_uint(i) === 3.U) && in_a_arbiter(i).io.out.fire()) { // && in_q_que_ios(i).deq.fire()){
+              reordered := true.B
+            }
+
+            println("gemminipri exist")
+            println(io_in(i).a.bits.params)
+            //in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach { x => x := io_in(i).a.bits.user.lift(GemminiPri).get } // GemminiPri
           }
-
-          println("gemminipri exist")
-          println(io_in(i).a.bits.params)
-          in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}  // GemminiPri
-        }
-        //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it works, but not as expected
-        dontTouch(in(i).a.ready)
+          //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it works, but not as expected
+          dontTouch(in(i).a.ready)
 
 
-      } else {
-        scala.Predef.assert(false)
-        throw new RuntimeException()
-        /*
+        } else {
+          scala.Predef.assert(false)
+          throw new RuntimeException()
+          /*
         in_q_que_ios(i).enq.bits.earlyValid := false.B
         in_q_que_ios(i).enq.bits.lateCancel := DontCare
         in_q_que_ios(i).enq.bits.bits := DontCare
@@ -352,48 +361,50 @@ object TLXbar_ACancel
         io_in(i).a.bits       := DontCare
 
          */
-      }
-      //in(i).a.bits.source := in_a_que(i).io.deq.bits.tl_a.bits.source // what is r start?
-      reorder_count := wrappingAdd(reorder_count, 1.U, reorder_count_max, reordered)
-      /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        }
+        //in(i).a.bits.source := in_a_que(i).io.deq.bits.tl_a.bits.source // what is r start?
+        reorder_count := wrappingAdd(reorder_count, 1.U, reorder_count_max, reordered)
 
-      if (connectBIO(i).exists(x=>x)) {
-        io_in(i).b :<> in(i).b
-        io_in(i).b.bits.source := trim(in(i).b.bits.source, r.size)
-      } else {
-        in(i).b.ready := true.B
-        in(i).b.bits  := DontCare
-        io_in(i).b.valid := false.B
-        io_in(i).b.bits  := DontCare
-      }
+        /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-      if (connectCIO(i).exists(x=>x)) {
-        in(i).c :<> io_in(i).c
-        in(i).c.bits.source := io_in(i).c.bits.source | r.start.U
-      } else {
-        in(i).c.valid := false.B
-        in(i).c.bits  := DontCare
-        io_in(i).c.ready := true.B
-        io_in(i).c.bits  := DontCare
-      }
+        if (connectBIO(i).exists(x => x)) {
+          io_in(i).b :<> in(i).b
+          io_in(i).b.bits.source := trim(in(i).b.bits.source, r.size)
+        } else {
+          in(i).b.ready := true.B
+          in(i).b.bits := DontCare
+          io_in(i).b.valid := false.B
+          io_in(i).b.bits := DontCare
+        }
 
-      if (connectDIO(i).exists(x=>x)) {
-        io_in(i).d :<> in(i).d
-        io_in(i).d.bits.source := trim(in(i).d.bits.source, r.size)
-      } else {
-        in(i).d.ready := true.B
-        in(i).d.bits  := DontCare
-        io_in(i).d.valid := false.B
-        io_in(i).d.bits  := DontCare
-      }
+        if (connectCIO(i).exists(x => x)) {
+          in(i).c :<> io_in(i).c
+          in(i).c.bits.source := io_in(i).c.bits.source | r.start.U
+        } else {
+          in(i).c.valid := false.B
+          in(i).c.bits := DontCare
+          io_in(i).c.ready := true.B
+          io_in(i).c.bits := DontCare
+        }
 
-      if (connectEIO(i).exists(x=>x)) {
-        in(i).e :<> io_in(i).e
-      } else {
-        in(i).e.valid := false.B
-        in(i).e.bits  := DontCare
-        io_in(i).e.ready := true.B
-        io_in(i).e.bits  := DontCare
+        if (connectDIO(i).exists(x => x)) {
+          io_in(i).d :<> in(i).d
+          io_in(i).d.bits.source := trim(in(i).d.bits.source, r.size)
+        } else {
+          in(i).d.ready := true.B
+          in(i).d.bits := DontCare
+          io_in(i).d.valid := false.B
+          io_in(i).d.bits := DontCare
+        }
+
+        if (connectEIO(i).exists(x => x)) {
+          in(i).e :<> io_in(i).e
+        } else {
+          in(i).e.valid := false.B
+          in(i).e.bits := DontCare
+          io_in(i).e.ready := true.B
+          io_in(i).e.bits := DontCare
+        }
       }
     }
 
