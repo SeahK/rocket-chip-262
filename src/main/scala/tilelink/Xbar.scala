@@ -34,11 +34,11 @@ object Util {
 object ForceFanout
 {
   def apply[T](
-    a: TriStateValue = TriStateValue.unset,
-    b: TriStateValue = TriStateValue.unset,
-    c: TriStateValue = TriStateValue.unset,
-    d: TriStateValue = TriStateValue.unset,
-    e: TriStateValue = TriStateValue.unset)(body: Parameters => T)(implicit p: Parameters) =
+                a: TriStateValue = TriStateValue.unset,
+                b: TriStateValue = TriStateValue.unset,
+                c: TriStateValue = TriStateValue.unset,
+                d: TriStateValue = TriStateValue.unset,
+                e: TriStateValue = TriStateValue.unset)(body: Parameters => T)(implicit p: Parameters) =
   {
     body(p.alterPartial {
       case ForceFanoutKey => p(ForceFanoutKey) match {
@@ -72,7 +72,7 @@ class TLXbar(policy: TLArbiter.Policy = TLArbiter.roundRobin)(implicit p: Parame
       val fifoIdFactory = TLXbar.relabeler()
       seq(0).v1copy(
         responseFields = BundleField.union(seq.flatMap(_.responseFields)),
-//        responseFields = BundleField.union(seq.flatMap(_.responseFields) :+ GemminiPriField()),
+        //        responseFields = BundleField.union(seq.flatMap(_.responseFields) :+ GemminiPriField()),
         requestKeys = seq.flatMap(_.requestKeys).distinct,
         minLatency = seq.map(_.minLatency).min,
         endSinkId = TLXbar.mapOutputIds(seq).map(_.end).max,
@@ -226,7 +226,7 @@ object TLXbar_ACancel
       cp.client.clients.exists { c => mp.manager.managers.exists { m =>
         c.visibility.exists { ca => m.address.exists { ma =>
           ca.overlaps(ma)}}}}
-      }.toVector}.toVector
+    }.toVector}.toVector
     val probeIO = (edgesIn zip reachableIO).map { case (cp, reachableO) =>
       (edgesOut zip reachableO).map { case (mp, reachable) =>
         reachable && cp.client.anySupportProbe && mp.manager.managers.exists(_.regionType >= RegionType.TRACKED)
@@ -263,7 +263,7 @@ object TLXbar_ACancel
     val in = Wire(Vec(io_in.size, TLBundle_ACancel(wide_bundle)))
 
     ///////////////////////////////////////// added part////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//    val in_a_que = Seq.fill(io_in.size){Module(new Queue(new TLBundleA(in(0).a.bits.params), 5))} // need change
+    //    val in_a_que = Seq.fill(io_in.size){Module(new Queue(new TLBundleA(in(0).a.bits.params), 5))} // need change
     val in_a_que = (0 until in.size).map{i => Module(new Queue(new TLBundleA(in(i).a.bits.params), 5))}
 
     val in_q_que_ios = in_a_que.map(_.io)
@@ -271,24 +271,35 @@ object TLXbar_ACancel
     println(connectAIO.foreach(println(_)))
     val gemminipri_reorder = WireInit(false.B) // activate reordering?
     val prior_vec_uint = Wire(Vec(in.size, UInt(2.W)))
+
     val reorder_count = RegInit(0.U(5.W)) // count number of reordering
     val reorder_count_max = WireInit(8.U) // 8:1 ratio (ToDo: configurable)
     val reordered = WireInit(false.B) // whether it is reordered or not (use to count up reorder_count)
 
     if(in.size != 0){
       val prior_vec = VecInit(Seq.fill(in.size)(false.B))
+      val prior_de_vec = VecInit(Seq.fill(in.size)(false.B))
 
       for(i <- 0 until in.size){
+        val prior_vec_reg = RegInit(VecInit(Seq.fill(in.size){0.U(2.W)}))
         in_a_que(i).io.deq.bits.user.lift(GemminiPri).foreach{x => dontTouch(x)}
         prior_vec_uint(i) := 0.U
         //prior_vec(i).foreach{x => dontTouch(x)}
         //getOrElse
         if(!in_a_que(i).io.deq.bits.user.lift(GemminiPri).isEmpty) {
-          prior_vec_uint := (0 until in.size).map{i => in_a_que(i).io.deq.bits.user.lift(GemminiPri).get}
-          prior_vec(i) := Mux(in_a_que(i).io.deq.bits.user.lift(GemminiPri).get === 3.U, true.B, false.B) // get pri field for the last element in the queue
+          //prior_vec_uint := (0 until in.size).map{i => in_a_que(i).io.deq.bits.user.lift(GemminiPri).get}
+          when(in_a_que(i).io.deq.valid){
+            prior_vec_uint(i) := in_a_que(i).io.deq.bits.user.lift(GemminiPri).get
+            prior_vec_reg(i) := in_a_que(i).io.deq.bits.user.lift(GemminiPri).get //register the value
+          }
+          prior_vec(i) := Mux(in_a_que(i).io.deq.valid, prior_vec_uint(i) === 3.U, prior_vec_reg(i) === 3.U)
+          prior_de_vec(i) := Mux(in_a_que(i).io.deq.valid, prior_vec_uint(i) =/= 2.U, prior_vec_reg(i) =/= 2.U)
+
+          //          prior_vec(i) := Mux(prior_vec_uint(i) === 3.U, true.B, false.B) // get pri field for the last element in the queue
+          //prior_de_vec(i) := Mux(prior_vec_uint(i) === 2.U, false.B, true.B)
         }
       }
-      gemminipri_reorder := prior_vec.reduce(_||_)
+      gemminipri_reorder := prior_vec.reduce(_||_) && !prior_de_vec.reduce(_ && _)
       dontTouch(gemminipri_reorder)
       dontTouch(prior_vec_uint)
       dontTouch(prior_vec)
@@ -314,7 +325,9 @@ object TLXbar_ACancel
 
         if(!io_in(i).a.bits.user.lift(GemminiPri).isEmpty){
           in_q_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
+          in(i).a.earlyValid := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in_q_que_ios(i).deq.valid)
           in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), true.B, false.B) // would this work?
+
 
           when(gemminipri_reorder && (prior_vec_uint(i) === 3.U) && in_q_que_ios(i).deq.fire()){
             reordered := true.B
@@ -322,7 +335,7 @@ object TLXbar_ACancel
 
           println("gemminipri exist")
           println(io_in(i).a.bits.params)
-          in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}  // GemminiPri
+          //in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}  // GemminiPri
         }
         //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it works, but not as expected
         dontTouch(in(i).a.ready)
@@ -335,12 +348,10 @@ object TLXbar_ACancel
         in_q_que_ios(i).enq.bits.earlyValid := false.B
         in_q_que_ios(i).enq.bits.lateCancel := DontCare
         in_q_que_ios(i).enq.bits.bits := DontCare
-
         // here? or depends on the output of the queue
         io_in(i).a.ready      := true.B
         io_in(i).a.lateCancel := DontCare
         io_in(i).a.bits       := DontCare
-
          */
       }
       //in(i).a.bits.source := in_a_que(i).io.deq.bits.tl_a.bits.source // what is r start?
