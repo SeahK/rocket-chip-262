@@ -304,6 +304,8 @@ object TLXbar_ACancel
       dontTouch(prior_vec_uint)
       dontTouch(prior_vec)
     }
+    // for cycle print out
+    val cycles = freechips.rocketchip.util.WideCounter(32)
 
     for (i <- 0 until in.size) {
       val r = inputIdRanges(i)
@@ -323,19 +325,26 @@ object TLXbar_ACancel
         in_q_que_ios(i).deq.ready := in(i).a.ready
 
 
-        if(!io_in(i).a.bits.user.lift(GemminiPri).isEmpty){
+        if(!io_in(i).a.bits.user.lift(GemminiPri).isEmpty) {
           in_q_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
           in(i).a.earlyValid := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in_q_que_ios(i).deq.valid)
           in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), true.B, false.B) // would this work?
 
-
-          when(gemminipri_reorder && (prior_vec_uint(i) === 3.U) && in_q_que_ios(i).deq.fire()){
+          when(gemminipri_reorder && (prior_vec_uint(i) === 3.U) && in_q_que_ios(i).deq.fire()) {
             reordered := true.B
           }
+
 
           println("gemminipri exist")
           println(io_in(i).a.bits.params)
           //in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}  // GemminiPri
+
+          // print only Gemmini load requests
+          if (!in(i).a.bits.user.lift(GemminiPri).isEmpty) {
+            when(in(i).a.fire() && (in(i).a.bits.user.lift(GemminiPri).get >= 2.U)) {
+              printf("GEMMINI_FIRE %x %x %x\n", cycles.value, i.asUInt(), in(i).a.bits.address)
+            }
+          }
         }
         //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it works, but not as expected
         dontTouch(in(i).a.ready)
@@ -386,15 +395,16 @@ object TLXbar_ACancel
         in(i).d.bits  := DontCare
         io_in(i).d.valid := false.B
         io_in(i).d.bits  := DontCare
+
       }
 
       if (connectEIO(i).exists(x=>x)) {
         in(i).e :<> io_in(i).e
       } else {
         in(i).e.valid := false.B
-        in(i).e.bits  := DontCare
+        in(i).e.bits := DontCare
         io_in(i).e.ready := true.B
-        io_in(i).e.bits  := DontCare
+        io_in(i).e.bits := DontCare
       }
     }
 
