@@ -261,7 +261,7 @@ object TLXbar_ACancel
 
     // Transform input bundle sources (sinks use global namespace on both sides)
     val in = Wire(Vec(io_in.size, TLBundle_ACancel(wide_bundle)))
-
+    val out = Wire(Vec(io_out.size, TLBundle_ACancel(wide_bundle)))
     ///////////////////////////////////////// added part////////////////////////////////////////////////////////////////////////////////////////////////////////////
     //    val in_a_que = Seq.fill(io_in.size){Module(new Queue(new TLBundleA(in(0).a.bits.params), 5))} // need change
     val in_a_que = (0 until in.size).map{i => Module(new Queue(new TLBundleA(in(i).a.bits.params), 5))}
@@ -269,6 +269,8 @@ object TLXbar_ACancel
     val in_q_que_ios = in_a_que.map(_.io)
     println(in.size)
     println(connectAIO.foreach(println(_)))
+    println(out.size)
+
     val gemminipri_reorder = WireInit(false.B) // activate reordering?
     val prior_vec_uint = Wire(Vec(in.size, UInt(2.W)))
 
@@ -276,84 +278,112 @@ object TLXbar_ACancel
     val reorder_count_max = WireInit(8.U) // 8:1 ratio (ToDo: configurable)
     val reordered = WireInit(false.B) // whether it is reordered or not (use to count up reorder_count)
 
-    if(in.size != 0){
+    val miss_zone = WireInit(true.B) // predirction - hit or miss? (turn off fierce reordering under hit)
+    val bank_access_vec = Wire(Vec(in.size, UInt(2.W)))
+    dontTouch(bank_access_vec)
+    bank_access_vec := (0 until in.size).map{i => ((in_a_que(i).io.deq.bits.address >> 6.U)(1, 0)).asUInt()} // for now, assume 4 banks (ToDo: parameterize with banks)
+
+    if(in.size != 0) {
       val prior_vec = VecInit(Seq.fill(in.size)(false.B))
       val prior_de_vec = VecInit(Seq.fill(in.size)(false.B))
 
-      for(i <- 0 until in.size){
-        val prior_vec_reg = RegInit(VecInit(Seq.fill(in.size){0.U(2.W)}))
-        in_a_que(i).io.deq.bits.user.lift(GemminiPri).foreach{x => dontTouch(x)}
+      // for bank level re-ordering
+      val bank_reorder_vec = VecInit(Seq.fill(in.size)(false.B))
+      for (i <- 0 until in.size) {
+        val bank_reorder_temp = VecInit(Seq.fill(in.size)(false.B))
+        for (j <- 0 until in.size) {
+          if (j != i) {
+            bank_reorder_temp(j) := (prior_vec_uint(j) === 3.U && bank_access_vec(j) === bank_access_vec(i)) && (prior_vec_uint(i) === 2.U)
+          }
+        } // bank conflict with priority request
+        bank_reorder_vec(i) := bank_reorder_temp.reduce(_||_)
+      }
+      dontTouch(bank_reorder_vec)
+
+      for (i <- 0 until in.size) {
+        val prior_vec_reg = RegInit(VecInit(Seq.fill(in.size) {
+          0.U(2.W)
+        }))
+        in_a_que(i).io.deq.bits.user.lift(GemminiPri).foreach { x => dontTouch(x) }
         prior_vec_uint(i) := 0.U
         //prior_vec(i).foreach{x => dontTouch(x)}
         //getOrElse
-        if(!in_a_que(i).io.deq.bits.user.lift(GemminiPri).isEmpty) {
+        if (!in_a_que(i).io.deq.bits.user.lift(GemminiPri).isEmpty) {
           //prior_vec_uint := (0 until in.size).map{i => in_a_que(i).io.deq.bits.user.lift(GemminiPri).get}
-          when(in_a_que(i).io.deq.valid){
+          when(in_a_que(i).io.deq.valid) {
             prior_vec_uint(i) := in_a_que(i).io.deq.bits.user.lift(GemminiPri).get
             prior_vec_reg(i) := in_a_que(i).io.deq.bits.user.lift(GemminiPri).get //register the value
           }
-          prior_vec(i) := Mux(in_a_que(i).io.deq.valid, prior_vec_uint(i) === 3.U, prior_vec_reg(i) === 3.U)
-          prior_de_vec(i) := Mux(in_a_que(i).io.deq.valid, prior_vec_uint(i) =/= 2.U, prior_vec_reg(i) =/= 2.U)
+          prior_vec(i) := Mux(in_a_que(i).io.deq.valid, prior_vec_uint(i) === 3.U, prior_vec_reg(i) === 3.U && miss_zone)
+          prior_de_vec(i) := Mux(in_a_que(i).io.deq.valid, prior_vec_uint(i) =/= 2.U, prior_vec_reg(i) =/= 2.U && miss_zone) //don't hold long reordering under hit zone
 
           //          prior_vec(i) := Mux(prior_vec_uint(i) === 3.U, true.B, false.B) // get pri field for the last element in the queue
           //prior_de_vec(i) := Mux(prior_vec_uint(i) === 2.U, false.B, true.B)
         }
       }
-      gemminipri_reorder := prior_vec.reduce(_||_) && !prior_de_vec.reduce(_ && _)
+      gemminipri_reorder := prior_vec.reduce(_ || _) && !prior_de_vec.reduce(_ && _) // has 2, 3 mixed
       dontTouch(gemminipri_reorder)
       dontTouch(prior_vec_uint)
       dontTouch(prior_vec)
-    }
-    // for cycle print out
-    val cycles = freechips.rocketchip.util.WideCounter(32)
-
-    for (i <- 0 until in.size) {
-      val r = inputIdRanges(i)
-
-      if(connectAIO(i).exists(x=>x)){
-        in_q_que_ios(i).enq.valid := true.B
-        in_q_que_ios(i).deq.ready := true.B
-
-        in_q_que_ios(i).enq :<> io_in(i).a.asDecoupled()
-        in_q_que_ios(i).enq.bits.source := io_in(i).a.bits.source | r.start.U
-        //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it does not work at all here
-
-        // this also does not work (stall right after first reordering)
-        in(i).a.earlyValid := in_q_que_ios(i).deq.valid
-        in(i).a.lateCancel := false.B
-        in(i).a.bits := in_q_que_ios(i).deq.bits
-        in_q_que_ios(i).deq.ready := in(i).a.ready
 
 
-        if(!io_in(i).a.bits.user.lift(GemminiPri).isEmpty) {
-          in_q_que_ios(i).deq.ready := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in(i).a.ready)
-          in(i).a.earlyValid := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), false.B, in_q_que_ios(i).deq.valid)
-          in(i).a.lateCancel := Mux(gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U), true.B, false.B) // would this work?
+      // for cycle print out
+      val cycles = freechips.rocketchip.util.WideCounter(32)
 
-          when(gemminipri_reorder && (prior_vec_uint(i) === 3.U) && in_q_que_ios(i).deq.fire()) {
-            reordered := true.B
-          }
+      for (i <- 0 until in.size) {
+        val r = inputIdRanges(i)
+
+        if (connectAIO(i).exists(x => x)) {
+          in_q_que_ios(i).enq.valid := true.B
+          in_q_que_ios(i).deq.ready := true.B
+
+          in_q_que_ios(i).enq :<> io_in(i).a.asDecoupled()
+          in_q_que_ios(i).enq.bits.source := io_in(i).a.bits.source | r.start.U
+          //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it does not work at all here
+
+          // this also does not work (stall right after first reordering)
+          in(i).a.earlyValid := in_q_que_ios(i).deq.valid
+          in(i).a.lateCancel := false.B
+          in(i).a.bits := in_q_que_ios(i).deq.bits
+          in_q_que_ios(i).deq.ready := in(i).a.ready
 
 
-          println("gemminipri exist")
-          println(io_in(i).a.bits.params)
-          //in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}  // GemminiPri
+          if (!io_in(i).a.bits.user.lift(GemminiPri).isEmpty) {
 
-          // print only Gemmini load requests
-          if (!in(i).a.bits.user.lift(GemminiPri).isEmpty) {
-            when(in(i).a.fire() && (in(i).a.bits.user.lift(GemminiPri).get >= 2.U)) {
-              printf("GEMMINI_FIRE %x %x %x\n", cycles.value, i.asUInt(), in(i).a.bits.address)
+            val reorder_cond = WireInit(miss_zone && gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U))
+            when(gemminipri_reorder && !miss_zone) {
+              reorder_cond := bank_reorder_vec(i)
+            }
+
+           // val reorder_cond = Mux(gemminipri_reorder && !miss_zone, bank_reorder_vec(i), miss_zone && gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U))
+            in_q_que_ios(i).deq.ready := Mux(reorder_cond, false.B, in(i).a.ready)
+            in(i).a.earlyValid := Mux(reorder_cond, false.B, in_q_que_ios(i).deq.valid)
+            in(i).a.lateCancel := Mux(reorder_cond, true.B, false.B) // would this work?
+
+            when(miss_zone && gemminipri_reorder && (prior_vec_uint(i) === 3.U) && in_q_que_ios(i).deq.fire()) {
+              reordered := true.B
+            }
+
+
+            println("gemminipri exist")
+            println(io_in(i).a.bits.params)
+            //in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x := io_in(i).a.bits.user.lift(GemminiPri).get}  // GemminiPri
+
+            // print only Gemmini load requests
+            if (!in(i).a.bits.user.lift(GemminiPri).isEmpty) {
+              when(in(i).a.fire() && (in(i).a.bits.user.lift(GemminiPri).get >= 2.U)) {
+                printf("GEMMINI_FIRE %x %x %x\n", cycles.value, i.asUInt(), in(i).a.bits.address)
+              }
             }
           }
-        }
-        //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it works, but not as expected
-        dontTouch(in(i).a.ready)
+          //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it works, but not as expected
+          dontTouch(in(i).a.ready)
 
 
-      } else {
-        scala.Predef.assert(false)
-        throw new RuntimeException()
-        /*
+        } else {
+          scala.Predef.assert(false)
+          throw new RuntimeException()
+          /*
         in_q_que_ios(i).enq.bits.earlyValid := false.B
         in_q_que_ios(i).enq.bits.lateCancel := DontCare
         in_q_que_ios(i).enq.bits.bits := DontCare
@@ -362,54 +392,55 @@ object TLXbar_ACancel
         io_in(i).a.lateCancel := DontCare
         io_in(i).a.bits       := DontCare
          */
-      }
-      //in(i).a.bits.source := in_a_que(i).io.deq.bits.tl_a.bits.source // what is r start?
-      reorder_count := wrappingAdd(reorder_count, 1.U, reorder_count_max, reordered)
-      /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        }
+        //in(i).a.bits.source := in_a_que(i).io.deq.bits.tl_a.bits.source // what is r start?
+        reorder_count := wrappingAdd(reorder_count, 1.U, reorder_count_max, reordered)
+        /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-      if (connectBIO(i).exists(x=>x)) {
-        io_in(i).b :<> in(i).b
-        io_in(i).b.bits.source := trim(in(i).b.bits.source, r.size)
-      } else {
-        in(i).b.ready := true.B
-        in(i).b.bits  := DontCare
-        io_in(i).b.valid := false.B
-        io_in(i).b.bits  := DontCare
-      }
+        if (connectBIO(i).exists(x => x)) {
+          io_in(i).b :<> in(i).b
+          io_in(i).b.bits.source := trim(in(i).b.bits.source, r.size)
+        } else {
+          in(i).b.ready := true.B
+          in(i).b.bits := DontCare
+          io_in(i).b.valid := false.B
+          io_in(i).b.bits := DontCare
+        }
 
-      if (connectCIO(i).exists(x=>x)) {
-        in(i).c :<> io_in(i).c
-        in(i).c.bits.source := io_in(i).c.bits.source | r.start.U
-      } else {
-        in(i).c.valid := false.B
-        in(i).c.bits  := DontCare
-        io_in(i).c.ready := true.B
-        io_in(i).c.bits  := DontCare
-      }
+        if (connectCIO(i).exists(x => x)) {
+          in(i).c :<> io_in(i).c
+          in(i).c.bits.source := io_in(i).c.bits.source | r.start.U
+        } else {
+          in(i).c.valid := false.B
+          in(i).c.bits := DontCare
+          io_in(i).c.ready := true.B
+          io_in(i).c.bits := DontCare
+        }
 
-      if (connectDIO(i).exists(x=>x)) {
-        io_in(i).d :<> in(i).d
-        io_in(i).d.bits.source := trim(in(i).d.bits.source, r.size)
-      } else {
-        in(i).d.ready := true.B
-        in(i).d.bits  := DontCare
-        io_in(i).d.valid := false.B
-        io_in(i).d.bits  := DontCare
+        if (connectDIO(i).exists(x => x)) {
+          io_in(i).d :<> in(i).d
+          io_in(i).d.bits.source := trim(in(i).d.bits.source, r.size)
+        } else {
+          in(i).d.ready := true.B
+          in(i).d.bits := DontCare
+          io_in(i).d.valid := false.B
+          io_in(i).d.bits := DontCare
 
-      }
+        }
 
-      if (connectEIO(i).exists(x=>x)) {
-        in(i).e :<> io_in(i).e
-      } else {
-        in(i).e.valid := false.B
-        in(i).e.bits := DontCare
-        io_in(i).e.ready := true.B
-        io_in(i).e.bits := DontCare
+        if (connectEIO(i).exists(x => x)) {
+          in(i).e :<> io_in(i).e
+        } else {
+          in(i).e.valid := false.B
+          in(i).e.bits := DontCare
+          io_in(i).e.ready := true.B
+          io_in(i).e.bits := DontCare
+        }
       }
     }
 
     // Transform output bundle sinks (sources use global namespace on both sides)
-    val out = Wire(Vec(io_out.size, TLBundle_ACancel(wide_bundle)))
+    //val out = Wire(Vec(io_out.size, TLBundle_ACancel(wide_bundle)))
     for (o <- 0 until out.size) {
       val r = outputIdRanges(o)
 
