@@ -207,11 +207,16 @@ object TLXbar
 }
 
 // added for priority encoding
-case object GemminiPri extends ControlKey[UInt]("pri_port")
+class GemminiPriBundle extends Bundle{
+  val pri = UInt(2.W)
+  val time = UInt(32.W) // need to decrease this
+}
+case object GemminiPri extends ControlKey[GemminiPriBundle]("pri_port")
 case class GemminiPriField() extends BundleField(GemminiPri) {
-  def data = Output(UInt(2.W))
-  def default(x: UInt): Unit = {
-    x := 0.U
+  def data = Output(new GemminiPriBundle)
+  def default(x: GemminiPriBundle): Unit = {
+    x.pri := 0.U
+    x.time := 0.U
   }
 }
 
@@ -266,6 +271,9 @@ object TLXbar_ACancel
     //    val in_a_que = Seq.fill(io_in.size){Module(new Queue(new TLBundleA(in(0).a.bits.params), 5))} // need change
     val in_a_que = (0 until in.size).map{i => Module(new Queue(new TLBundleA(in(i).a.bits.params), 5))}
 
+    // for cycle print out & encode cycles to user field
+    val cycles = freechips.rocketchip.util.WideCounter(32)
+
     val in_q_que_ios = in_a_que.map(_.io)
     println(in.size)
     println(connectAIO.foreach(println(_)))
@@ -289,16 +297,30 @@ object TLXbar_ACancel
 
       // for bank level re-ordering
       val bank_reorder_vec = VecInit(Seq.fill(in.size)(false.B))
+      val time_reorder_vec = VecInit(Seq.fill(in.size)(false.B)) // with same priority, same bank -> allow earlier first
       for (i <- 0 until in.size) {
+        //bank_reorder_vec(i) := bank_access_vec.map(_ === bank_access_vec(i)).reduce(_ || _)
         val bank_reorder_temp = VecInit(Seq.fill(in.size)(false.B))
+        val earliest = WireInit(i.asUInt())
         for (j <- 0 until in.size) {
           if (j != i) {
             bank_reorder_temp(j) := (prior_vec_uint(j) === 3.U && bank_access_vec(j) === bank_access_vec(i)) && (prior_vec_uint(i) === 2.U)
+
+            // when bank, priority is same, pick earliest (ToDo: how to make this shorter?)
+            if (!in_a_que(i).io.deq.bits.user.lift(GemminiPri).isEmpty) {
+              when(prior_vec_uint(j) === prior_vec_uint(i) && bank_access_vec(j) === bank_access_vec(i) && prior_vec_uint(j) > 1.U) {
+                when(in_a_que(i).io.deq.bits.user.lift(GemminiPri).get.time > in_a_que(j).io.deq.bits.user.lift(GemminiPri).get.time) {
+                  earliest := j.asUInt()
+                }
+              }
+            }
           }
-        } // bank conflict with priority request
+        } // bank conflict with priority request (prioritize priority request when bank conflict)
+        time_reorder_vec(i) := (i.asUInt() =/= earliest) // if this is not the earliest one (if there is another core with same bank, priority)
         bank_reorder_vec(i) := bank_reorder_temp.reduce(_||_)
       }
       dontTouch(bank_reorder_vec)
+      dontTouch(time_reorder_vec)
 
       for (i <- 0 until in.size) {
         val prior_vec_reg = RegInit(VecInit(Seq.fill(in.size) {
@@ -311,24 +333,21 @@ object TLXbar_ACancel
         if (!in_a_que(i).io.deq.bits.user.lift(GemminiPri).isEmpty) {
           //prior_vec_uint := (0 until in.size).map{i => in_a_que(i).io.deq.bits.user.lift(GemminiPri).get}
           when(in_a_que(i).io.deq.valid) {
-            prior_vec_uint(i) := in_a_que(i).io.deq.bits.user.lift(GemminiPri).get
-            prior_vec_reg(i) := in_a_que(i).io.deq.bits.user.lift(GemminiPri).get //register the value
+            prior_vec_uint(i) := in_a_que(i).io.deq.bits.user.lift(GemminiPri).get.pri
+            prior_vec_reg(i) := in_a_que(i).io.deq.bits.user.lift(GemminiPri).get.pri //register the value
           }
           prior_vec(i) := Mux(in_a_que(i).io.deq.valid, prior_vec_uint(i) === 3.U, prior_vec_reg(i) === 3.U && miss_zone)
-          prior_de_vec(i) := Mux(in_a_que(i).io.deq.valid, prior_vec_uint(i) =/= 2.U, prior_vec_reg(i) =/= 2.U && miss_zone) //don't hold long reordering under hit zone
+          //prior_de_vec(i) := Mux(in_a_que(i).io.deq.valid, prior_vec_uint(i) =/= 2.U, prior_vec_reg(i) =/= 2.U && miss_zone) //don't hold long reordering under hit zone
 
           //          prior_vec(i) := Mux(prior_vec_uint(i) === 3.U, true.B, false.B) // get pri field for the last element in the queue
           //prior_de_vec(i) := Mux(prior_vec_uint(i) === 2.U, false.B, true.B)
         }
       }
-      gemminipri_reorder := prior_vec.reduce(_ || _) && !prior_de_vec.reduce(_ && _) // has 2, 3 mixed
+      gemminipri_reorder := prior_vec.reduce(_ || _)// && !prior_de_vec.reduce(_ && _) // has 2, 3 mixed
       dontTouch(gemminipri_reorder)
       dontTouch(prior_vec_uint)
       dontTouch(prior_vec)
 
-
-      // for cycle print out
-      val cycles = freechips.rocketchip.util.WideCounter(32)
 
       for (i <- 0 until in.size) {
         val r = inputIdRanges(i)
@@ -340,6 +359,9 @@ object TLXbar_ACancel
           in_q_que_ios(i).enq :<> io_in(i).a.asDecoupled()
           in_q_que_ios(i).enq.bits.source := io_in(i).a.bits.source | r.start.U
           //in(i).a :<> ReadyValidCancel(in_q_que_ios(i).deq) // it does not work at all here
+          if(!in_q_que_ios(i).enq.bits.user.lift(GemminiPri).isEmpty){
+            in_q_que_ios(i).enq.bits.user.lift(GemminiPri).foreach{x => x.time := cycles}
+          }
 
           // this also does not work (stall right after first reordering)
           in(i).a.earlyValid := in_q_que_ios(i).deq.valid
@@ -350,13 +372,17 @@ object TLXbar_ACancel
 
           if (!io_in(i).a.bits.user.lift(GemminiPri).isEmpty) {
 
-            val reorder_cond = WireInit(miss_zone && gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U))
+            val reorder_cond = WireInit((miss_zone && gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U)) || bank_reorder_vec(i) || time_reorder_vec(i))
+            /*
             when(gemminipri_reorder && !miss_zone) {
               reorder_cond := bank_reorder_vec(i)
             }
 
+             */
+
            // val reorder_cond = Mux(gemminipri_reorder && !miss_zone, bank_reorder_vec(i), miss_zone && gemminipri_reorder && (prior_vec_uint(i) === 2.U) && (reorder_count =/= reorder_count_max - 1.U))
             in_q_que_ios(i).deq.ready := Mux(reorder_cond, false.B, in(i).a.ready)
+            in_q_que_ios(i).deq.bits.user.lift(GemminiPri).foreach{x => dontTouch(x.time)} // for debugging
             in(i).a.earlyValid := Mux(reorder_cond, false.B, in_q_que_ios(i).deq.valid)
             in(i).a.lateCancel := Mux(reorder_cond, true.B, false.B) // would this work?
 
@@ -371,8 +397,11 @@ object TLXbar_ACancel
 
             // print only Gemmini load requests
             if (!in(i).a.bits.user.lift(GemminiPri).isEmpty) {
-              when(in(i).a.fire() && (in(i).a.bits.user.lift(GemminiPri).get >= 2.U)) {
-                printf("GEMMINI_FIRE %x %x %x\n", cycles.value, i.asUInt(), in(i).a.bits.address)
+              when(in(i).a.fire() && (in(i).a.bits.user.lift(GemminiPri).get.pri >= 2.U)) {
+                printf("GEMMINI_INA_FIRE %x %x %x\n", cycles.value, i.asUInt(), in(i).a.bits.address)
+              }
+              when(in(i).a.earlyValid && !in_q_que_ios(i).deq.ready && (in(i).a.bits.user.lift(GemminiPri).get.pri >= 2.U)){
+                printf("GEMMINI_INA_MISS %x %x %x\n", cycles.value, i.asUInt(), in(i).a.bits.address)
               }
             }
           }
